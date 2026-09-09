@@ -10,18 +10,18 @@ const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 
 const app = express();
-app.use(cors({
-  origin: (origin, cb) => {
-    // Allow: localhost dev, any Vercel preview/prod URL, or no origin (curl/Postman)
-    if (!origin || origin.includes('localhost') || origin.includes('.vercel.app') || origin.includes(process.env.FRONTEND_URL || '')) {
-      cb(null, true);
-    } else {
-      cb(new Error('CORS blocked'));
-    }
-  },
-  credentials: true
-}));
-app.use(express.json());
+
+// Permissive CORS to allow all origins and preflight requests unconditionally
+app.use(cors());
+app.options('*', cors());
+
+// Body parsing with safe limits
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Health check endpoints for Railway / monitoring
+app.get('/health', (req, res) => res.status(200).send('OK'));
+app.get('/', (req, res) => res.status(200).json({ status: 'online', service: 'hackops26-backend' }));
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const textModel = 'qwen/qwen3.8-27b';
@@ -65,9 +65,15 @@ function saveDocuments() {
     fs.renameSync(tmpFile, DOCS_FILE);
 }
 
-// Multer
+// Multer with safe file size limits
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const upload = multer({
+    storage: storage,
+    limits: {
+        fileSize: 25 * 1024 * 1024, // 25 MB max per file
+        files: 20
+    }
+});
 
 // Groq Rate Limiter Class
 class GroqRateLimiter {
@@ -205,45 +211,53 @@ app.post('/api/upload', upload.array('pages'), async (req, res) => {
         documents.push(newDoc);
         saveDocuments();
 
-        // Stage 1: Normalize (Sharp)
+        // Stage 1: Normalize (Sharp - sequential to avoid memory spikes on cloud containers)
         console.log(`[Stage 1] Normalizing ${req.files.length} pages...`);
-        const processedImages = await Promise.all(req.files.map(async f => {
-            return await sharp(f.buffer)
-                .resize({ width: 1500, height: 1500, fit: 'inside', withoutEnlargement: true })
-                .jpeg({ quality: 85 })
+        const processedImages = [];
+        for (let idx = 0; idx < req.files.length; idx++) {
+            const buf = await sharp(req.files[idx].buffer)
+                .resize({ width: 1200, height: 1200, fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 80 })
                 .toBuffer();
-        }));
+            processedImages.push(buf);
+        }
 
-        // Stage 2: OCR (Tesseract local)
+        // Stage 2: OCR (Tesseract local with guaranteed worker termination)
         console.log(`[Stage 2] OCR starting...`);
-        const worker = await Tesseract.createWorker(['eng', 'hin']);
+        let worker = null;
         const pagesOcr = [];
         const uncertainSpans = [];
 
-        for (let i = 0; i < processedImages.length; i++) {
-            console.log(`[Stage 2] OCR Page ${i+1}/${processedImages.length}`);
-            try {
-                const { data } = await worker.recognize(processedImages[i]);
-                pagesOcr.push({ index: i, text: data.text });
-                
-                // Extract uncertain words safely if available
-                if (data.blocks) {
-                    data.blocks.forEach(b => {
-                        if(b.paragraphs) b.paragraphs.forEach(p => {
-                            if(p.lines) p.lines.forEach(l => {
-                                if(l.words) l.words.forEach(w => {
-                                    if(w.confidence < 60 && w.text.length > 3) uncertainSpans.push(w.text);
+        try {
+            worker = await Tesseract.createWorker(['eng', 'hin']);
+            for (let i = 0; i < processedImages.length; i++) {
+                console.log(`[Stage 2] OCR Page ${i+1}/${processedImages.length}`);
+                try {
+                    const { data } = await worker.recognize(processedImages[i]);
+                    pagesOcr.push({ index: i, text: data.text });
+                    
+                    // Extract uncertain words safely if available
+                    if (data.blocks) {
+                        data.blocks.forEach(b => {
+                            if (b.paragraphs) b.paragraphs.forEach(p => {
+                                if (p.lines) p.lines.forEach(l => {
+                                    if (l.words) l.words.forEach(w => {
+                                        if (w.confidence < 60 && w.text.length > 3) uncertainSpans.push(w.text);
+                                    });
                                 });
                             });
                         });
-                    });
+                    }
+                } catch (err) {
+                    console.error(`Page ${i+1} OCR failed:`, err);
+                    pagesOcr.push({ index: i, text: "\n[OCR FAILED FOR THIS PAGE]\n" });
                 }
-            } catch (err) {
-                console.error(`Page ${i+1} OCR failed:`, err);
-                pagesOcr.push({ index: i, text: "\n[OCR FAILED FOR THIS PAGE]\n" });
+            }
+        } finally {
+            if (worker) {
+                await worker.terminate().catch(e => console.error("Worker termination error:", e));
             }
         }
-        await worker.terminate();
 
         // Stage 3: Assemble
         console.log(`[Stage 3] Assembling text...`);
@@ -491,6 +505,14 @@ STRICT RULES:
     } catch (error) {
         console.error("Chat Error:", error);
         res.status(500).json({ error: "Chat failed" });
+    }
+});
+
+// Global Express Error Handler
+app.use((err, req, res, next) => {
+    console.error("[Server Error]", err);
+    if (!res.headersSent) {
+        res.status(err.status || 500).json({ error: err.message || "An internal error occurred" });
     }
 });
 
