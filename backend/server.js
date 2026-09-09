@@ -147,8 +147,8 @@ class GroqRateLimiter {
 }
 const rateLimiter = new GroqRateLimiter();
 
-// Endpoints
-app.get('/api/documents', (req, res) => {
+// Endpoints (supporting both /api/* and /* paths so env var mismatches don't break routing)
+app.get(['/api/documents', '/documents'], (req, res) => {
     res.json(documents.filter(d => d.status === 'completed').map(d => {
         const doc = { ...d };
         delete doc.paragraphs;
@@ -156,7 +156,7 @@ app.get('/api/documents', (req, res) => {
     }));
 });
 
-app.get('/api/bns-map', (req, res) => {
+app.get(['/api/bns-map', '/bns-map'], (req, res) => {
     try {
         const bnsMap = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'ipc_bns_map.json'), 'utf-8'));
         res.json(bnsMap);
@@ -166,7 +166,7 @@ app.get('/api/bns-map', (req, res) => {
 });
 
 // Demo Safety Net Bypass
-app.post('/api/demo', (req, res) => {
+app.post(['/api/demo', '/demo'], (req, res) => {
     try {
         if (fs.existsSync(DEMO_CACHE_FILE)) {
             const demoDoc = JSON.parse(fs.readFileSync(DEMO_CACHE_FILE, 'utf-8'));
@@ -180,7 +180,7 @@ app.post('/api/demo', (req, res) => {
 });
 
 // The Pipeline
-app.post('/api/upload', upload.array('pages'), async (req, res) => {
+app.post(['/api/upload', '/upload'], upload.array('pages'), async (req, res) => {
     try {
         if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
 
@@ -380,7 +380,7 @@ app.post('/api/upload', upload.array('pages'), async (req, res) => {
 });
 
 // Chat Endpoint (4-Tier Context: 3 grounded + 1 general)
-app.post('/api/chat', async (req, res) => {
+app.post(['/api/chat', '/chat'], async (req, res) => {
     try {
         const { documentId, question } = req.body;
         const doc = documents.find(d => d.id === documentId);
@@ -401,11 +401,11 @@ app.post('/api/chat', async (req, res) => {
 
         // Tier 0: Answer from structured JSON metadata only
         const metadata = JSON.stringify({
-            doc_type: doc.structuredData.doc_type,
-            case_number: doc.structuredData.case_number,
-            court_name: doc.structuredData.court_name,
-            parties: doc.structuredData.parties,
-            key_dates: doc.structuredData.key_dates
+            doc_type: doc.structuredData?.doc_type,
+            case_number: doc.structuredData?.case_number,
+            court_name: doc.structuredData?.court_name,
+            parties: doc.structuredData?.parties,
+            key_dates: doc.structuredData?.key_dates
         });
 
         console.log(`[Chat] Trying Tier 0...`);
@@ -459,7 +459,7 @@ Question: ${question}`
             content: `You are a helpful legal assistant. Answer the user's question based on the full document text below. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). After your answer, on a new line write QUOTE: followed by a short verbatim phrase from the text that supports your answer. If you cannot find a clear answer in the document, reply ONLY with: NOT_IN_DOCUMENT
 
 Document:
-${doc.structuredData.raw_text.substring(0, 20000)}
+${(doc.structuredData?.raw_text || '').substring(0, 20000)}
 
 Question: ${question}`
         }], 768, 0.2);
@@ -516,7 +516,7 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 5001;
-app.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend listening on 0.0.0.0:${PORT}`));
 
 
 
