@@ -356,14 +356,27 @@ app.post('/api/upload', upload.array('pages'), async (req, res) => {
     }
 });
 
-// Chat Endpoint (3-Tier Context)
+// Chat Endpoint (4-Tier Context: 3 grounded + 1 general)
 app.post('/api/chat', async (req, res) => {
     try {
         const { documentId, question } = req.body;
         const doc = documents.find(d => d.id === documentId);
         if (!doc) return res.status(404).json({ error: 'Document not found' });
 
-        // Tier 0: Check Structured Data
+        // Helper to call Groq in plain text mode (works with thinking models)
+        const callGroqChat = async (messages, maxTokens, temp) => {
+            const response = await rateLimiter.fetchWithBackoff(() => groq.chat.completions.create({
+                model: textModel,
+                messages,
+                temperature: temp,
+                max_tokens: maxTokens
+            }), maxTokens);
+            const raw = response.choices[0]?.message?.content || '';
+            // Strip <think> blocks from thinking models
+            return raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        };
+
+        // Tier 0: Answer from structured JSON metadata only
         const metadata = JSON.stringify({
             doc_type: doc.structuredData.doc_type,
             case_number: doc.structuredData.case_number,
@@ -372,76 +385,98 @@ app.post('/api/chat', async (req, res) => {
             key_dates: doc.structuredData.key_dates
         });
 
-        const tier0Prompt = `You are a helpful legal assistant. Answer the user's question using ONLY the provided JSON metadata.
-        If the metadata does not contain the answer, reply exactly with: "INSUFFICIENT_DATA".
-        Metadata: ${metadata}
-        Question: ${question}`;
-
         console.log(`[Chat] Trying Tier 0...`);
-        const tier0Resp = await rateLimiter.fetchWithBackoff(() => groq.chat.completions.create({
-            model: textModel,
-            messages: [{ role: 'user', content: tier0Prompt }],
-            temperature: 0.1,
-            max_tokens: 512
-        }), 512);
+        const tier0Answer = await callGroqChat([{
+            role: 'user',
+            content: `You are a helpful legal assistant. Answer the user's question using ONLY the provided JSON metadata about a legal case. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). If the metadata does not contain enough information to answer, reply ONLY with the exact string: INSUFFICIENT_DATA
 
-        const tier0Ans = tier0Resp.choices[0]?.message?.content.trim();
-        if (tier0Ans && tier0Ans !== "INSUFFICIENT_DATA") {
-            return res.json({ answer: tier0Ans, supporting_quote: "Derived from case metadata" });
+Metadata: ${metadata}
+Question: ${question}`
+        }], 512, 0.1);
+
+        if (tier0Answer && !tier0Answer.includes('INSUFFICIENT_DATA')) {
+            return res.json({ answer: tier0Answer, supporting_quote: '', source: 'document' });
         }
 
-        // Tier 1: Keyword Match Paragraphs
+        // Tier 1: Keyword-match paragraphs
         console.log(`[Chat] Trying Tier 1...`);
         const keywords = question.toLowerCase().split(/\W+/).filter(w => w.length > 3);
-        let relevantParas = doc.paragraphs.filter(p => keywords.some(k => p.text.toLowerCase().includes(k)));
-        
+        const relevantParas = (doc.paragraphs || []).filter(p =>
+            keywords.some(k => p.text.toLowerCase().includes(k))
+        );
+
         if (relevantParas.length > 0) {
             const contextText = relevantParas.map(p => p.text).join('\n\n').substring(0, 10000);
-            const tier1Prompt = `You are a helpful legal assistant. Answer the user's question using ONLY the provided text snippets.
-            Include a "supporting_quote" that proves your answer.
-            Return exactly in this JSON format: { "answer": "...", "supporting_quote": "..." }
-            If the text does not contain the answer, reply with answer: "INSUFFICIENT_DATA".
-            Text: ${contextText}
-            Question: ${question}`;
+            const tier1Answer = await callGroqChat([{
+                role: 'user',
+                content: `You are a helpful legal assistant. Answer the user's question using ONLY the provided text snippets from a legal document. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). After your answer, on a new line write QUOTE: followed by a short verbatim phrase from the text that supports your answer. If the text does not contain the answer, reply ONLY with: INSUFFICIENT_DATA
 
-            const tier1Resp = await rateLimiter.fetchWithBackoff(() => groq.chat.completions.create({
-                model: textModel,
-                messages: [{ role: 'user', content: tier1Prompt }],
-                response_format: { type: "json_object" },
-                temperature: 0.1,
-                max_tokens: 512
-            }), 512);
+Text snippets:
+${contextText}
 
-            try {
-                const parsed = JSON.parse(tier1Resp.choices[0]?.message?.content);
-                if (parsed.answer && parsed.answer !== "INSUFFICIENT_DATA") {
-                    return res.json(parsed);
-                }
-            } catch(e) {}
+Question: ${question}`
+            }], 768, 0.1);
+
+            if (tier1Answer && !tier1Answer.includes('INSUFFICIENT_DATA')) {
+                // Extract the quote line if present
+                const quoteMatch = tier1Answer.match(/QUOTE:\s*(.+)/i);
+                const cleanAnswer = tier1Answer.replace(/QUOTE:.*/i, '').trim();
+                return res.json({
+                    answer: cleanAnswer,
+                    supporting_quote: quoteMatch ? quoteMatch[1].trim() : '',
+                    source: 'document'
+                });
+            }
         }
 
-        // Tier 2: Full Text Fallback
+        // Tier 2: Full text fallback
         console.log(`[Chat] Trying Tier 2 (Full Text)...`);
-        const fullPrompt = `You are a helpful legal assistant. Answer the user's question based on the document text below.
-        Return exactly in this JSON format: { "answer": "...", "supporting_quote": "..." }
-        If you cannot find the answer, reply with answer: "I couldn't find this in the document."
-        Text: ${doc.structuredData.raw_text.substring(0, 20000)}
-        Question: ${question}`;
+        const tier2Answer = await callGroqChat([{
+            role: 'user',
+            content: `You are a helpful legal assistant. Answer the user's question based on the full document text below. Detect the language of the question and answer in the SAME language (English, Hindi, or Marathi). After your answer, on a new line write QUOTE: followed by a short verbatim phrase from the text that supports your answer. If you cannot find a clear answer in the document, reply ONLY with: NOT_IN_DOCUMENT
 
-        const tier2Resp = await rateLimiter.fetchWithBackoff(() => groq.chat.completions.create({
-            model: textModel,
-            messages: [{ role: 'user', content: fullPrompt }],
-            response_format: { type: "json_object" },
-            temperature: 0.2,
-            max_tokens: 512
-        }), 512);
+Document:
+${doc.structuredData.raw_text.substring(0, 20000)}
 
-        try {
-            const parsed = JSON.parse(tier2Resp.choices[0]?.message?.content);
-            return res.json(parsed);
-        } catch(e) {
-            return res.json({ answer: tier2Resp.choices[0]?.message?.content, supporting_quote: "" });
+Question: ${question}`
+        }], 768, 0.2);
+
+        if (tier2Answer && !tier2Answer.includes('NOT_IN_DOCUMENT') && tier2Answer.length > 20) {
+            const quoteMatch = tier2Answer.match(/QUOTE:\s*(.+)/i);
+            const cleanAnswer = tier2Answer.replace(/QUOTE:.*/i, '').trim();
+            return res.json({
+                answer: cleanAnswer,
+                supporting_quote: quoteMatch ? quoteMatch[1].trim() : '',
+                source: 'document'
+            });
         }
+
+        // Tier 3: General legal assistant fallback (not grounded in the document)
+        console.log(`[Chat] Falling back to Tier 3 (General Assistant)...`);
+        const tier3Answer = await callGroqChat([
+            {
+                role: 'system',
+                content: `You are a friendly assistant helping someone understand the Indian legal system. Many users are anxious litigants who may not be fluent in English.
+
+STRICT RULES:
+- Keep answers SHORT — 2 to 4 plain sentences by default. No markdown headers, no numbered lists, no bold text unless the user explicitly asks for steps or a detailed explanation (e.g. "explain in detail", "what are all the steps").
+- If you need to ask a clarifying question, ask ONLY ONE — the single most important one. Never ask multiple questions at once.
+- End with ONE brief line: "For advice specific to your situation, consult a qualified advocate."
+- Do NOT repeat disclaimers or caveats more than once.
+- Detect the language of the user's question (English, Hindi, or Marathi) and respond in the SAME language.
+- If the question seems to be about their specific uploaded document, gently suggest they use the document chat instead.`
+            },
+            {
+                role: 'user',
+                content: question
+            }
+        ], 400, 0.4);
+
+        return res.json({
+            answer: tier3Answer,
+            supporting_quote: '',
+            source: 'general'
+        });
 
     } catch (error) {
         console.error("Chat Error:", error);
@@ -451,3 +486,6 @@ app.post('/api/chat', async (req, res) => {
 
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, () => console.log(`Backend listening on port ${PORT}`));
+
+
+

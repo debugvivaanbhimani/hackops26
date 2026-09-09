@@ -25,9 +25,14 @@ function App() {
   const [chatLoading, setChatLoading] = useState(false);
   
   const [isListening, setIsListening] = useState(false);
+  const [voiceLang, setVoiceLang] = useState('en-IN'); // en-IN | hi-IN | mr-IN
+  const [voiceError, setVoiceError] = useState(null);
   const recognitionRef = useRef(null);
 
   const [bnsMap, setBnsMap] = useState([]);
+  // Detect speech support — Safari uses webkit prefix, Chrome uses standard
+  const hasSpeechRecognition = typeof window !== 'undefined' && 
+    ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window);
 
   useEffect(() => {
     fetchDocuments();
@@ -53,36 +58,73 @@ function App() {
     }
   };
 
+  // Create the SpeechRecognition instance ONCE at mount.
+  // Safari requires the instance to exist before .start() is called from a user gesture.
+  // Do NOT recreate the object on every call — instead update .lang in place.
   const initSpeechRecognition = () => {
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-      recognitionRef.current = new SpeechRecognition();
-      recognitionRef.current.continuous = false;
-      recognitionRef.current.lang = 'hi-IN'; // Default to Hindi
-      
-      recognitionRef.current.onresult = (event) => {
-        const transcript = event.results[0][0].transcript;
-        setChatMessage(prev => prev + ' ' + transcript);
-      };
+    if (!hasSpeechRecognition) return;
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = voiceLang;
+    
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      setChatMessage(prev => prev ? prev + ' ' + transcript : transcript);
+      setVoiceError(null);
+    };
+    recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error);
+      setIsListening(false);
+      if (event.error === 'not-allowed') {
+        setVoiceError('Microphone access denied. Please allow mic access in your browser settings.');
+      } else if (event.error === 'no-speech') {
+        setVoiceError('No speech detected. Try again.');
+      } else {
+        setVoiceError(`Voice error: ${event.error}`);
+      }
+    };
+    recognition.onend = () => setIsListening(false);
+    recognitionRef.current = recognition;
+  };
 
-      recognitionRef.current.onerror = (event) => {
-        console.error('Speech recognition error', event.error);
-        setIsListening(false);
-      };
+  useEffect(() => {
+    initSpeechRecognition();
+  }, []); // Create once on mount
 
-      recognitionRef.current.onend = () => {
+  // When voiceLang changes, just update .lang on the existing instance
+  useEffect(() => {
+    if (recognitionRef.current) {
+      recognitionRef.current.lang = voiceLang;
+    }
+  }, [voiceLang]);
+
+  const toggleListen = () => {
+    if (!hasSpeechRecognition || !recognitionRef.current) return;
+    setVoiceError(null);
+    if (isListening) {
+      recognitionRef.current.stop();
+    } else {
+      try {
+        recognitionRef.current.lang = voiceLang; // ensure lang is current
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {
+        // Safari can throw if start() is called while already started
+        console.error('Could not start recognition:', e);
+        setVoiceError('Could not start mic. Try tapping the button again.');
         setIsListening(false);
-      };
+      }
     }
   };
 
-  const toggleListen = () => {
-    if (isListening) {
-      recognitionRef.current?.stop();
-    } else {
-      recognitionRef.current?.start();
-      setIsListening(true);
-    }
+  const cycleLang = () => {
+    const langs = ['en-IN', 'hi-IN', 'mr-IN'];
+    const labels = { 'en-IN': 'EN', 'hi-IN': 'HI', 'mr-IN': 'MR' };
+    const next = langs[(langs.indexOf(voiceLang) + 1) % langs.length];
+    setVoiceLang(next);
+    return labels[next];
   };
 
   const handleFileUpload = async (event) => {
@@ -167,7 +209,12 @@ function App() {
         documentId: selectedDoc.id,
         question: msgToSend
       });
-      setChatHistory([...newHistory, { type: 'ai', text: response.data.answer, quote: response.data.supporting_quote }]);
+      setChatHistory([...newHistory, { 
+        type: 'ai', 
+        text: response.data.answer, 
+        quote: response.data.supporting_quote,
+        source: response.data.source || 'document'
+      }]);
     } catch (error) {
       console.error('Chat failed', error);
       setChatHistory([...newHistory, { type: 'ai', text: 'Sorry, failed to get an answer.', quote: '' }]);
@@ -456,6 +503,15 @@ function App() {
                                             {msg.quote && (
                                                 <p className="text-[12px] mt-3 pt-3 border-t border-clawde-ink/10 italic text-clawde-ink/60 font-sans">"{msg.quote}"</p>
                                             )}
+                                            {msg.type === 'ai' && (
+                                                <div className="mt-2 pt-2 border-t border-clawde-ink/5 flex items-center gap-1">
+                                                    {msg.source === 'general' ? (
+                                                        <span className="text-[10px] font-sans font-semibold uppercase tracking-wider text-clawde-brass opacity-80">⚡ General guidance</span>
+                                                    ) : (
+                                                        <span className="text-[10px] font-sans font-semibold uppercase tracking-wider text-clawde-ink/30">📄 From document</span>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
                                     </div>
                                 ))}
@@ -467,20 +523,42 @@ function App() {
                             </div>
                             
                             <div className="pt-4 border-t border-clawde-ink/10 shrink-0">
+                                {voiceError && (
+                                    <p className="text-[11px] text-clawde-oxblood font-sans mb-2 flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" /> {voiceError}
+                                    </p>
+                                )}
+                                {!hasSpeechRecognition && (
+                                    <p className="text-[11px] text-clawde-ink/40 font-sans mb-2">
+                                        🎙 Voice input works best in Chrome. Safari has limited support.
+                                    </p>
+                                )}
                                 <div className="flex gap-2">
-                                    <button 
-                                        onClick={toggleListen}
-                                        className={`p-3 transition-colors border ${isListening ? 'bg-clawde-oxblood text-white border-clawde-oxblood animate-pulse' : 'bg-white text-clawde-ink border-clawde-ink/20 hover:bg-clawde-parchment'}`}
-                                        title="Use Voice (Hindi/English)"
-                                    >
-                                        {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                                    </button>
+                                    {hasSpeechRecognition && (
+                                      <>
+                                        <button 
+                                            onClick={toggleListen}
+                                            className={`p-3 transition-colors border ${isListening ? 'bg-clawde-oxblood text-white border-clawde-oxblood animate-pulse' : 'bg-white text-clawde-ink border-clawde-ink/20 hover:bg-clawde-parchment'}`}
+                                            title={`Dictate (${voiceLang}) — click language badge to change`}
+                                        >
+                                            {isListening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                                        </button>
+                                        <button
+                                            onClick={cycleLang}
+                                            disabled={isListening}
+                                            className="px-2 text-[10px] font-bold font-sans uppercase tracking-widest border border-clawde-ink/20 bg-white text-clawde-ink/50 hover:text-clawde-ink hover:border-clawde-ink/40 disabled:opacity-40 transition-colors"
+                                            title="Cycle voice language: EN / HI / MR"
+                                        >
+                                            {voiceLang === 'en-IN' ? 'EN' : voiceLang === 'hi-IN' ? 'HI' : 'MR'}
+                                        </button>
+                                      </>
+                                    )}
                                     <input 
                                         type="text"
                                         value={chatMessage}
                                         onChange={(e) => setChatMessage(e.target.value)}
                                         onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-                                        placeholder="Ask a question about this document..."
+                                        placeholder="Ask in English, Hindi, or Marathi..."
                                         className="flex-1 bg-white border border-clawde-ink/20 px-4 py-2 text-sm focus:outline-none focus:border-clawde-brass font-sans placeholder-clawde-ink/30"
                                     />
                                     <button 
