@@ -13,7 +13,6 @@ const app = express();
 
 // Permissive CORS to allow all origins and preflight requests unconditionally
 app.use(cors());
-app.options('*', cors());
 
 // Body parsing with safe limits
 app.use(express.json({ limit: '50mb' }));
