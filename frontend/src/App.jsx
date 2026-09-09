@@ -5,7 +5,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 
 // Use CDN for worker to avoid bundler issues
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-const API_URL = 'http://localhost:5001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
 
 function App() {
   const [documents, setDocuments] = useState([]);

@@ -10,7 +10,17 @@ const sharp = require('sharp');
 const Tesseract = require('tesseract.js');
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow: localhost dev, any Vercel preview/prod URL, or no origin (curl/Postman)
+    if (!origin || origin.includes('localhost') || origin.includes('.vercel.app') || origin.includes(process.env.FRONTEND_URL || '')) {
+      cb(null, true);
+    } else {
+      cb(new Error('CORS blocked'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json());
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
