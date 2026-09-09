@@ -22,7 +22,14 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.get('/health', (req, res) => res.status(200).send('OK'));
 app.get('/', (req, res) => res.status(200).json({ status: 'online', service: 'hackops26-backend' }));
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Initialize Groq safely (prevents boot crash if env var is missing or injected after startup)
+let groq;
+try {
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'placeholder_key' });
+} catch (e) {
+    console.error("[Init Warning] Groq client failed to initialize:", e.message);
+    groq = { chat: { completions: { create: async () => { throw new Error("GROQ_API_KEY is not configured on the server."); } } } };
+}
 const textModel = 'qwen/qwen3.8-27b';
 
 // Helper: strip <think>...</think> blocks from thinking models and extract JSON
